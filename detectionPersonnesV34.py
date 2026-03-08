@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-compteur_hailo_v33.py
+compteur_hailo_v35.py
+
+Format de sortie Hailo NMS BY CLASS (FLOAT32) pour yolov8n.hef :
+  Buffer max 2004 bytes = 501 floats, structuré par classe :
+  [num_detections, y_min_0, x_min_0, y_max_0, x_max_0, score_0, ...]
+  - Premier float = nombre de détections (cast en int)
+  - Chaque détection = 5 floats : y_min, x_min, y_max, x_max, score
+  - Coordonnées normalisées [0,1] relatives à l'image d'entrée 320x320
+  - NMS hardware (IoU 0.70, score threshold 0.200), 1 classe (personne)
 """
 
 import cv2
@@ -26,7 +34,13 @@ except ImportError as e:
     exit(1)
 
 class YOLOPostProcess:
-    """Post-processing pour YOLOv8n - Avec transformation inverse correcte"""
+    """Post-processing pour yolov8n.hef - format HAILO NMS BY CLASS (FLOAT32)
+
+    Le buffer de sortie est structuré ainsi (1 classe, max 100 bbox) :
+      [num_detections, y_min_0, x_min_0, y_max_0, x_max_0, score_0, ...]
+    Coordonnées normalisées [0,1], ordre Y avant X.
+    Le NMS est déjà effectué par le hardware Hailo.
+    """
 
     def __init__(self):
         self.debug_done = False
@@ -34,53 +48,49 @@ class YOLOPostProcess:
     def process_yolo_output(self, output, conf_threshold=0.5,
                        input_shape=(320,320), original_shape=(960,540),
                        scale=1.0, pad_x=0, pad_y=0):
-        """Traite la sortie de yolov8n.hef - format Hailo NMS (1, 5, 100)"""
+        """Parse le buffer HAILO NMS BY CLASS et convertit vers l'espace image originale."""
         detections = []
 
         if output is None:
             return detections
 
         try:
-            # output shape: (1, 5, 100) → on squeeze le batch
-            if isinstance(output, np.ndarray):
-                raw = output
-            elif isinstance(output, list):
-                raw = output[0][0] if isinstance(output[0], list) else output[0]
-
-            # Normaliser en ndarray
-            raw = np.array(raw)
+            # Convertir en ndarray et aplatir en 1D
+            raw = np.array(output).flatten().astype(np.float32)
 
             if not self.debug_done:
-                print(f"\n🔍 DEBUG - Shape brute: {raw.shape}")
+                print(f"\n🔍 DEBUG - Buffer brut: {raw.shape[0]} floats")
                 print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
+                print(f"  Premiers floats: {raw[:16]}")
 
-            # Format (1, 5, 100) → (5, 100), puis transpose → (100, 5)
-            if raw.ndim == 3:
-                raw = raw[0]          # → (5, 100)
-            if raw.shape[0] == 5:
-                raw = raw.T           # → (100, 5) : chaque ligne = une détection
+            # Premier float = nombre de détections
+            num_detections = int(raw[0])
 
             if not self.debug_done:
-                print(f"  Shape après reshape: {raw.shape}")
-                # Afficher les 3 meilleures détections (conf = colonne 4)
-                top = raw[raw[:, 4].argsort()[::-1][:3]]
-                print(f"  Top 3 détections brutes:\n{top}")
+                print(f"  Nombre de détections: {num_detections}")
 
-            for i in range(raw.shape[0]):
-                conf = float(raw[i, 4])
-                if conf < conf_threshold:
+            # Chaque détection = 5 floats : y_min, x_min, y_max, x_max, score
+            for i in range(num_detections):
+                offset = 1 + i * 5
+                if offset + 5 > raw.shape[0]:
+                    break
+
+                y_min_n = float(raw[offset + 0])
+                x_min_n = float(raw[offset + 1])
+                y_max_n = float(raw[offset + 2])
+                x_max_n = float(raw[offset + 3])
+                score   = float(raw[offset + 4])
+
+                if score < conf_threshold:
                     continue
 
-                # Coordonnées normalisées (0-1) dans l'espace 320×320 paddé
-                x1_n, y1_n, x2_n, y2_n = raw[i, 0], raw[i, 1], raw[i, 2], raw[i, 3]
+                # Coordonnées normalisées → pixels dans l'espace paddé (input_shape)
+                x1p = x_min_n * input_shape[1]
+                y1p = y_min_n * input_shape[0]
+                x2p = x_max_n * input_shape[1]
+                y2p = y_max_n * input_shape[0]
 
-                # → pixels dans l'espace paddé (320×320)
-                x1p = x1_n * input_shape[1]
-                y1p = y1_n * input_shape[0]
-                x2p = x2_n * input_shape[1]
-                y2p = y2_n * input_shape[0]
-
-                # Enlever le padding → espace image redimensionnée (sans padding)
+                # Enlever le padding → espace image redimensionnée
                 x1p -= pad_x
                 y1p -= pad_y
                 x2p -= pad_x
@@ -99,17 +109,17 @@ class YOLOPostProcess:
                 y2 = max(0, min(y2, original_shape[0] - 1))
 
                 if not self.debug_done and i == 0:
-                    print(f"\n  Première détection après correction:")
-                    print(f"    Normalisé: [{x1_n:.3f}, {y1_n:.3f}, {x2_n:.3f}, {y2_n:.3f}]")
+                    print(f"\n  Première détection:")
+                    print(f"    Normalisé (y,x): [{y_min_n:.3f}, {x_min_n:.3f}, {y_max_n:.3f}, {x_max_n:.3f}]")
                     print(f"    Pixels paddés: [{x1p+pad_x:.1f}, {y1p+pad_y:.1f}, {x2p+pad_x:.1f}, {y2p+pad_y:.1f}]")
-                    print(f"    Final: [{x1}, {y1}, {x2}, {y2}], conf: {conf:.3f}")
+                    print(f"    Final: [{x1}, {y1}, {x2}, {y2}], score: {score:.3f}")
 
                 w = x2 - x1
                 h = y2 - y1
-                if w > 10 and h > 20:   # seuil réduit pour ne pas filtrer trop
+                if w > 10 and h > 20:
                     detections.append({
                         'bbox': [x1, y1, x2, y2],
-                        'conf': conf,
+                        'conf': score,
                         'center_y': (y1 + y2) // 2
                     })
 
@@ -462,37 +472,6 @@ class CompteurHailoFinal:
                         progress = (frame_count / total_frames) * 100
                         print(f"  Progression: {frame_count}/{total_frames} ({progress:.1f}%)")
 
-                    # Prétraitement avec récupération des paramètres de transformation
-                    """input_tensor, scale, pad_x, pad_y = self.preprocess(frame)
-
-                    try:
-                        input_data = {self.input_vstream_info.name: input_tensor}
-
-                        if frame_count == 1:
-                            print(f"  Taille du tenseur d'entrée: {input_tensor.nbytes} bytes")
-                            print(f"  Shape: {input_tensor.shape}")
-                            print(f"  dtype: {input_tensor.dtype}")
-                            print(f"  Min/Max: {input_tensor.min()}/{input_tensor.max()}")
-                            print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
-
-                        output_data = self.infer_pipeline.infer(input_data)
-
-                    except Exception as e:
-                        print(f"⚠️ Erreur inférence à la frame {frame_count}: {e}")
-                        continue
-
-                    detections = []
-                    if output_data and self.output_vstream_info.name in output_data:
-                        model_output = output_data[self.output_vstream_info.name]
-                        detections = self.postproc.process_yolo_output(
-                            model_output,
-                            conf_threshold=self.conf_threshold,
-                            original_shape=self.original_shape,
-                            input_shape=(self.input_height, self.input_width),
-                            scale=scale,
-                            pad_x=pad_x,
-                            pad_y=pad_y
-                        )"""
                     detections = self.detect_tiled(frame)
 
                     tracked = self.tracker.update(detections)
