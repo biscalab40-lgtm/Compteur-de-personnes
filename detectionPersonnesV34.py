@@ -241,10 +241,11 @@ class TrajectoryTracker:
 class CompteurHailoFinal:
     """Application principale"""
 
-    def __init__(self, hef_path, input_source=0, conf_threshold=0.5):
+    def __init__(self, hef_path, input_source=0, conf_threshold=0.5, line_y=None):
         self.hef_path = hef_path
         self.input_source = input_source
         self.conf_threshold = conf_threshold
+        self.line_y = line_y
         self.tracker = TrajectoryTracker()
         self.postproc = YOLOPostProcess()
         self.vdevice = None
@@ -441,7 +442,10 @@ class CompteurHailoFinal:
             print(f"📊 Frames totales: {total_frames}")
 
         # self.tracker.ligne = height // 1.5
-        self.tracker.ligne = int(height * 0.67)  # ligne à 2/3 de l'image = zone de passage
+        if self.line_y is None:
+            self.tracker.ligne = int(height * 0.67)  # ligne à 2/3 de l'image = zone de passage
+        else:
+            self.tracker.ligne = self.line_y
         print(f"📏 Ligne de comptage: Y={self.tracker.ligne}")
 
         print("🚀 Démarrage du compteur...")
@@ -568,6 +572,8 @@ def main():
                        help='Source d\'entrée: 0 pour caméra USB, ou chemin vers fichier vidéo')
     parser.add_argument('--conf', '-c', type=float, default=0.5,
                        help='Seuil de confiance pour les détections (défaut: 0.5)')
+    parser.add_argument('--line', '-l', type=int, default=None,
+                       help='Position Y de la ligne de comptage (défaut: milieu de l\'image)')
 
     args = parser.parse_args()
 
@@ -592,7 +598,7 @@ def main():
         return
 
     try:
-        app = CompteurHailoFinal(hef_path, input_source, args.conf)
+        app = CompteurHailoFinal(hef_path, input_source, args.conf, args.line)
         app.run()
     except KeyboardInterrupt:
         print("\n⏹️ Arrêt demandé")
