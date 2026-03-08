@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-compteur_hailo_v38.py
-
-Format de sortie Hailo NMS BY CLASS (FLOAT32) pour yolov8n.hef :
-  Buffer max 2004 bytes = 501 floats, structuré par classe :
-  [num_detections, y_min_0, x_min_0, y_max_0, x_max_0, score_0, ...]
-  - Premier float = nombre de détections (cast en int)
-  - Chaque détection = 5 floats : y_min, x_min, y_max, x_max, score
-  - Coordonnées normalisées [0,1] relatives à l'image d'entrée 320x320
-  - NMS hardware (IoU 0.70, score threshold 0.200), 1 classe (personne)
+compteur_hailo_final.py - Version complète et fonctionnelle
+Compteur de personnes avec HailoRT 4.20.0 sur Raspberry Pi 5
 """
 
 import cv2
@@ -26,7 +19,7 @@ try:
                                FormatType, InferVStreams, HailoSchedulingAlgorithm)
     HAILO_AVAILABLE = True
     print("✅ HailoRT chargé")
-
+    
     import hailo_platform
     print(f"📦 Version: {hailo_platform.__version__}")
 except ImportError as e:
@@ -34,40 +27,38 @@ except ImportError as e:
     exit(1)
 
 class YOLOPostProcess:
-    """Post-processing pour yolov8n.hef - Format concaténé sans compteur"""
-
+    """Post-processing pour yolov8n.hef - format concaténé sans compteur"""
+    
     def __init__(self):
         self.debug_done = False
-
+    
     def process_yolo_output(self, output, conf_threshold=0.5,
-                       input_shape=(320,320), original_shape=(960,540),
-                       scale=1.0, pad_x=0, pad_y=0):
+                          input_shape=(320,320), original_shape=(960,540),
+                          scale=1.0, pad_x=0, pad_y=0):
         """Parse le buffer de sortie (détections concaténées)"""
         detections = []
-
+        
         if output is None:
             return detections
-
+        
         try:
             # Convertir en ndarray et aplatir en 1D
             raw = np.array(output).flatten().astype(np.float32)
-
+            
             if raw.size == 0:
                 return detections
-
+            
             if not self.debug_done:
                 print(f"\n🔍 DEBUG - Buffer brut: {raw.shape[0]} floats")
                 print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
-                print(f"  raw: {raw}")
                 print(f"  raw[0] = {raw[0]:.3f}")
-
+            
             # Format: toutes les détections concaténées, chaque détection = 5 floats
-            # [y_min, x_min, y_max, x_max, score] répété
             num_detections = raw.shape[0] // 5
             
             if not self.debug_done:
                 print(f"  Nombre de détections (déduit): {num_detections}")
-
+            
             # Chaque détection = 5 floats : y_min, x_min, y_max, x_max, score
             for i in range(num_detections):
                 offset = i * 5
@@ -77,40 +68,39 @@ class YOLOPostProcess:
                 y_max_n = float(raw[offset + 2])
                 x_max_n = float(raw[offset + 3])
                 score   = float(raw[offset + 4])
-
+                
                 if score < conf_threshold:
                     continue
-
+                
                 # Coordonnées normalisées → pixels dans l'espace paddé
                 x1p = x_min_n * input_shape[1]
                 y1p = y_min_n * input_shape[0]
                 x2p = x_max_n * input_shape[1]
                 y2p = y_max_n * input_shape[0]
-
+                
                 # Enlever le padding
                 x1p -= pad_x
                 y1p -= pad_y
                 x2p -= pad_x
                 y2p -= pad_y
-
+                
                 # Appliquer l'échelle inverse
                 x1 = int(x1p / scale)
                 y1 = int(y1p / scale)
                 x2 = int(x2p / scale)
                 y2 = int(y2p / scale)
-
+                
                 # Clamp aux dimensions originales
                 x1 = max(0, min(x1, original_shape[1] - 1))
                 y1 = max(0, min(y1, original_shape[0] - 1))
                 x2 = max(0, min(x2, original_shape[1] - 1))
                 y2 = max(0, min(y2, original_shape[0] - 1))
-
+                
                 if not self.debug_done and i == 0:
                     print(f"\n  Première détection:")
                     print(f"    Normalisé (y,x): [{y_min_n:.3f}, {x_min_n:.3f}, {y_max_n:.3f}, {x_max_n:.3f}]")
-                    print(f"    Pixels paddés: [{x1p+pad_x:.1f}, {y1p+pad_y:.1f}, {x2p+pad_x:.1f}, {y2p+pad_y:.1f}]")
                     print(f"    Final: [{x1}, {y1}, {x2}, {y2}], score: {score:.3f}")
-
+                
                 w = x2 - x1
                 h = y2 - y1
                 if w > 10 and h > 20:
@@ -119,76 +109,53 @@ class YOLOPostProcess:
                         'conf': score,
                         'center_y': (y1 + y2) // 2
                     })
-
+        
         except Exception as e:
             print(f"⚠️ Erreur post-processing: {e}")
             import traceback
             traceback.print_exc()
-
+        
         if not self.debug_done:
             print(f"\n  📊 {len(detections)} détection(s) valides")
             self.debug_done = True
-
+        
         return detections
 
 class TemporalSmoother:
     """Lisse les détections sur plusieurs frames pour stabiliser les trajectoires"""
     
     def __init__(self, history_size=5, original_shape=(540, 960)):
-        """
-        Args:
-            history_size: nombre de frames à garder en mémoire pour le lissage
-            original_shape: dimensions de l'image (hauteur, largeur) pour validation
-        """
-        self.history = {}  # track_id -> liste de (bbox, conf)
+        self.history = {}
         self.history_size = history_size
-        self.original_shape = original_shape  # (height, width)
+        self.original_shape = original_shape
     
     def update_shape(self, height, width):
-        """Met à jour les dimensions de l'image (appelé à chaque frame si besoin)"""
+        """Met à jour les dimensions de l'image"""
         self.original_shape = (height, width)
     
     def smooth(self, track_id, bbox, conf):
-        """
-        Ajoute une nouvelle détection et retourne la version lissée
-        
-        Args:
-            track_id: identifiant unique de la piste
-            bbox: [x1, y1, x2, y2]
-            conf: score de confiance
-            
-        Returns:
-            tuple: (bbox_lissé, conf_lissée)
-        """
-        # Initialiser l'historique pour ce track si nécessaire
+        """Ajoute une détection et retourne la version lissée"""
         if track_id not in self.history:
             self.history[track_id] = []
         
-        # Ajouter la nouvelle détection
         self.history[track_id].append((bbox, conf))
         
-        # Limiter la taille de l'historique
         if len(self.history[track_id]) > self.history_size:
             self.history[track_id].pop(0)
         
-        # Si on a assez d'historique, on lisse
         if len(self.history[track_id]) >= 3:
-            # Prendre les 3 dernières détections
             recent = self.history[track_id][-3:]
-            
-            # Moyenne pondérée par la confiance
             total_conf = sum(b[1] for b in recent)
+            
             if total_conf > 0:
-                # Moyenne des coordonnées pondérée par la confiance
                 avg_bbox = [
-                    int(sum(b[0][0] * b[1] for b in recent) / total_conf),  # x1
-                    int(sum(b[0][1] * b[1] for b in recent) / total_conf),  # y1
-                    int(sum(b[0][2] * b[1] for b in recent) / total_conf),  # x2
-                    int(sum(b[0][3] * b[1] for b in recent) / total_conf)   # y2
+                    int(sum(b[0][0] * b[1] for b in recent) / total_conf),
+                    int(sum(b[0][1] * b[1] for b in recent) / total_conf),
+                    int(sum(b[0][2] * b[1] for b in recent) / total_conf),
+                    int(sum(b[0][3] * b[1] for b in recent) / total_conf)
                 ]
                 avg_conf = total_conf / len(recent)
             else:
-                # Fallback si confiances nulles
                 avg_bbox = [
                     int(sum(b[0][0] for b in recent) / len(recent)),
                     int(sum(b[0][1] for b in recent) / len(recent)),
@@ -197,11 +164,9 @@ class TemporalSmoother:
                 ]
                 avg_conf = conf
             
-            # Vérifier que la boîte lissée a une taille raisonnable
             w = avg_bbox[2] - avg_bbox[0]
             h = avg_bbox[3] - avg_bbox[1]
             
-            # Si la boîte lissée est trop déformée ou hors limites, on garde l'originale
             if (w < 10 or h < 20 or 
                 w > self.original_shape[1] or 
                 h > self.original_shape[0] or
@@ -212,26 +177,16 @@ class TemporalSmoother:
             
             return avg_bbox, avg_conf
         else:
-            # Pas assez d'historique, on retourne la détection brute
             return bbox, conf
     
     def cleanup(self, active_tracks):
-        """
-        Nettoie l'historique des tracks qui ne sont plus actifs
-        
-        Args:
-            active_tracks: liste des IDs de tracks actuellement suivis
-        """
-        to_remove = []
-        for track_id in self.history:
-            if track_id not in active_tracks:
-                to_remove.append(track_id)
-        
-        for track_id in to_remove:
-            del self.history[track_id]
+        """Nettoie l'historique des tracks disparus"""
+        to_remove = [tid for tid in self.history if tid not in active_tracks]
+        for tid in to_remove:
+            del self.history[tid]
 
 class TrajectoryTracker:
-    """Tracker ultra-robuste avec filtrage temporel et Kalman"""
+    """Tracker robuste avec IOU, Kalman et lissage temporel"""
     
     def __init__(self, ligne_centrale=300):
         self.ligne = ligne_centrale
@@ -239,55 +194,150 @@ class TrajectoryTracker:
         self.next_id = 0
         self.tracks = {}
         
-        # Initialiser le smoother (les dimensions seront mises à jour à la première frame)
-        self.smoother = TemporalSmoother(history_size=5, original_shape=(540, 960))
-        
-        # Paramètres optimisés
+        self.smoother = TemporalSmoother(history_size=5)
         self.iou_threshold = 0.3
         self.max_lost = 8
         self.kalman_enabled = True
         self.min_confidence = 0.3
     
-    def update(self, detections, frame_shape=None):
-        """
-        Met à jour le tracking avec les nouvelles détections
+    def _init_kalman(self, bbox):
+        """Initialise un filtre de Kalman"""
+        kf = cv2.KalmanFilter(6, 2)
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0]
+        ], np.float32)
         
-        Args:
-            detections: liste des détections de la frame courante
-            frame_shape: (hauteur, largeur) de la frame courante
-        """
-        # Mettre à jour les dimensions de l'image si fournies
+        kf.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0],
+            [0, 1, 0, 0, 0, 1],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1]
+        ], np.float32)
+        
+        kf.processNoiseCov = np.eye(6, dtype=np.float32) * 0.01
+        
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        
+        kf.statePre = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
+        kf.statePost = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
+        
+        return kf
+    
+    def _compute_iou(self, box1, box2):
+        """Calcule l'IoU entre deux boîtes"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - inter
+        
+        return inter / union if union > 0 else 0
+    
+    def _predict(self):
+        """Prédit la position des tracks pour la frame suivante"""
+        for track_id in self.tracks:
+            if self.kalman_enabled and self.tracks[track_id]['kalman'] is not None:
+                kf = self.tracks[track_id]['kalman']
+                predicted = kf.predict()
+                cx_pred, cy_pred = predicted[0,0], predicted[1,0]
+                last_bbox = self.tracks[track_id]['bbox']
+                w = last_bbox[2] - last_bbox[0]
+                h = last_bbox[3] - last_bbox[1]
+                self.tracks[track_id]['predicted_bbox'] = [
+                    int(cx_pred - w//2),
+                    int(cy_pred - h//2),
+                    int(cx_pred + w//2),
+                    int(cy_pred + h//2)
+                ]
+    
+    def _associate(self, detections):
+        """Associe les détections aux tracks existants"""
+        if not self.tracks or not detections:
+            return {}, list(range(len(detections))), list(self.tracks.keys())
+        
+        iou_matrix = np.zeros((len(self.tracks), len(detections)))
+        
+        for t_idx, track_id in enumerate(self.tracks):
+            track_bbox = self.tracks[track_id].get('predicted_bbox', self.tracks[track_id]['bbox'])
+            for d_idx, det in enumerate(detections):
+                iou_matrix[t_idx, d_idx] = self._compute_iou(track_bbox, det['bbox'])
+        
+        matched = {}
+        unmatched_det = list(range(len(detections)))
+        unmatched_track = list(range(len(self.tracks)))
+        
+        while unmatched_track and unmatched_det:
+            max_iou = self.iou_threshold
+            best_t = best_d = -1
+            
+            for t in unmatched_track:
+                for d in unmatched_det:
+                    if iou_matrix[t, d] > max_iou:
+                        max_iou = iou_matrix[t, d]
+                        best_t, best_d = t, d
+            
+            if best_t == -1:
+                break
+            
+            track_id = list(self.tracks.keys())[best_t]
+            matched[best_d] = track_id
+            unmatched_track.remove(best_t)
+            unmatched_det.remove(best_d)
+        
+        unmatched_track_ids = [list(self.tracks.keys())[i] for i in unmatched_track]
+        return matched, unmatched_det, unmatched_track_ids
+    
+    def _update_kalman(self, track_id, measurement):
+        """Met à jour le filtre de Kalman"""
+        if not self.kalman_enabled:
+            return
+        
+        kf = self.tracks[track_id]['kalman']
+        if kf is None:
+            return
+        
+        kf.predict()
+        kf.correct(np.array([[measurement[0]], [measurement[1]]], np.float32))
+        
+        cx = kf.statePost[0,0]
+        cy = kf.statePost[1,0]
+        w = kf.statePost[2,0]
+        h = kf.statePost[3,0]
+        
+        self.tracks[track_id]['kalman_bbox'] = [
+            int(cx - w/2), int(cy - h/2),
+            int(cx + w/2), int(cy + h/2)
+        ]
+    
+    def update(self, detections, frame_shape=None):
+        """Met à jour le tracking avec les nouvelles détections"""
+        
         if frame_shape is not None:
             self.smoother.update_shape(frame_shape[0], frame_shape[1])
         
-        # ... (suite du code existant)
-        
-        # Mettre à jour la résolution de l'image si disponible
-        if detections and 'original_shape' in detections[0]:
-            self.original_shape = detections[0]['original_shape']
-        
-        # Associer détections ↔ tracks
+        self._predict()
         matched, unmatched_det, unmatched_track = self._associate(detections)
         
-        # Mettre à jour les tracks associés
         for det_idx, track_id in matched.items():
             det = detections[det_idx]
+            smooth_bbox, smooth_conf = self.smoother.smooth(track_id, det['bbox'], det['conf'])
             
-            # LISSAGE TEMPOREL - Application
-            smooth_bbox, smooth_conf = self.smoother.smooth(
-                track_id, det['bbox'], det['conf']
-            )
-            
-            # Si la confiance lissée est trop basse, on garde quand même ?
-            # On utilise le max des deux confiances pour être conservateur
-            effective_conf = max(smooth_conf, det['conf'])
-            if effective_conf < self.min_confidence:
+            if smooth_conf < self.min_confidence:
                 continue
             
             cx = (smooth_bbox[0] + smooth_bbox[2]) // 2
             cy = (smooth_bbox[1] + smooth_bbox[3]) // 2
             
-            # Vérifier le franchissement de ligne
             old_side = self.tracks[track_id]['side']
             new_side = 'below' if cy > self.ligne else 'above'
             
@@ -296,25 +346,20 @@ class TrajectoryTracker:
                 self.tracks[track_id]['counted'] = True
                 print(f"✅ Personne {track_id} comptée! Total: {self.compteur}")
             
-            # Mettre à jour les données
             self.tracks[track_id].update({
-                'bbox': smooth_bbox,  # Utiliser la version lissée
+                'bbox': smooth_bbox,
                 'center': (cx, cy),
                 'side': new_side,
                 'lost': 0,
-                'last_seen': time.time(),
-                'confidence': effective_conf
+                'last_seen': time.time()
             })
-            
-            # Mettre à jour Kalman
             self._update_kalman(track_id, (cx, cy))
         
-        # Créer nouveaux tracks
         for det_idx in unmatched_det:
             det = detections[det_idx]
             if det['conf'] < self.min_confidence:
                 continue
-                
+            
             cx = (det['bbox'][0] + det['bbox'][2]) // 2
             cy = (det['bbox'][1] + det['bbox'][3]) // 2
             
@@ -325,44 +370,33 @@ class TrajectoryTracker:
                 'lost': 0,
                 'counted': False,
                 'last_seen': time.time(),
-                'confidence': det['conf'],
                 'kalman': self._init_kalman(det['bbox'])
             }
-            
-            # Initialiser le smoother pour ce nouveau track
             self.smoother.smooth(self.next_id, det['bbox'], det['conf'])
             self.next_id += 1
         
-        # Nettoyer les tracks perdus
-        to_delete = []
-        for track_id, track in self.tracks.items():
-            if track['lost'] > self.max_lost:
-                to_delete.append(track_id)
+        for track_id in unmatched_track:
+            self.tracks[track_id]['lost'] += 1
         
-        # Nettoyer le smoother avant de supprimer les tracks
+        to_delete = [tid for tid, track in self.tracks.items() if track['lost'] > self.max_lost]
         active_tracks = set(self.tracks.keys()) - set(to_delete)
         self.smoother.cleanup(active_tracks)
         
         for tid in to_delete:
             del self.tracks[tid]
         
-        # Retourner les tracks actifs
         current_tracks = []
         for track_id, track in self.tracks.items():
             if track['lost'] == 0:
-                # Utiliser la bbox Kalman si disponible, sinon la bbox lissée
-                if 'kalman_bbox' in track:
-                    bbox = track['kalman_bbox']
-                else:
-                    bbox = track['bbox']
+                bbox = track.get('kalman_bbox', track['bbox'])
                 det = {'bbox': bbox, 'center_y': track['center'][1]}
                 current_tracks.append((track_id, det))
         
         return current_tracks
-    
+
 class CompteurHailoFinal:
     """Application principale"""
-
+    
     def __init__(self, hef_path, input_source=0, conf_threshold=0.5, line_y=None):
         self.hef_path = hef_path
         self.input_source = input_source
@@ -376,167 +410,96 @@ class CompteurHailoFinal:
         self.input_vstream_info = None
         self.output_vstream_info = None
         self.is_video_file = isinstance(input_source, str) and os.path.exists(input_source)
-
+        
         if not os.path.exists(hef_path):
             raise FileNotFoundError(f"Modèle non trouvé: {hef_path}")
-
+        
         self.init_hailo()
-
+    
     def init_hailo(self):
         """Initialisation Hailo"""
         print(f"📁 Chargement: {self.hef_path}")
         self.hef = HEF(self.hef_path)
-
+        
         self.input_vstream_info = self.hef.get_input_vstream_infos()[0]
         self.output_vstream_info = self.hef.get_output_vstream_infos()[0]
-
+        
         print(f"📥 Entrée: {self.input_vstream_info.name}, shape: {self.input_vstream_info.shape}")
         print(f"📤 Sortie: {self.output_vstream_info.name}, shape: {self.output_vstream_info.shape}")
-
+        
         if len(self.input_vstream_info.shape) == 3:
             self.input_height = self.input_vstream_info.shape[0]
             self.input_width = self.input_vstream_info.shape[1]
         elif len(self.input_vstream_info.shape) == 4:
             self.input_height = self.input_vstream_info.shape[2]
             self.input_width = self.input_vstream_info.shape[3]
-
+        
         print(f"📥 Dimensions d'entrée: {self.input_width}x{self.input_height}")
-
+        
         try:
             params = VDevice.create_params()
             params.scheduling_algorithm = HailoSchedulingAlgorithm.NONE
             self.vdevice = VDevice(params=params)
             print("✅ VDevice créé")
-
+            
             configure_params = ConfigureParams.create_from_hef(
                 hef=self.hef,
                 interface=HailoStreamInterface.PCIe
             )
             print("✅ Paramètres de configuration créés")
-
+            
             network_groups = self.vdevice.configure(self.hef, configure_params)
             self.network_group = network_groups[0]
             self.network_group_params = self.network_group.create_params()
             print("✅ Réseau configuré")
-
+            
             self.input_vstreams_params = InputVStreamParams.make(
                 self.network_group,
                 format_type=FormatType.UINT8
             )
-
+            
             self.output_vstreams_params = OutputVStreamParams.make(
                 self.network_group,
                 format_type=FormatType.FLOAT32
             )
-
+            
             print("✅ Paramètres des streams créés")
-
+            
             self.infer_pipeline = InferVStreams(
                 self.network_group,
                 self.input_vstreams_params,
                 self.output_vstreams_params
             )
             print("✅ Pipeline d'inférence créé")
-
+            
         except Exception as e:
             print(f"❌ Erreur initialisation Hailo: {e}")
             import traceback
             traceback.print_exc()
             raise
-
-    def preprocess_single(self, frame):
-        """Prétraitement standard (utilisé pour chaque tuile)"""
+    
+    def preprocess(self, frame):
+        """Prétraitement de l'image"""
         h, w = frame.shape[:2]
+        self.original_shape = (h, w)
+        
         scale = min(self.input_width / w, self.input_height / h)
         new_w = int(w * scale)
         new_h = int(h * scale)
+        
         resized = cv2.resize(frame, (new_w, new_h))
+        
         pad_x = (self.input_width - new_w) // 2
         pad_y = (self.input_height - new_h) // 2
+        
         padded = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
         padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+        
         tensor = np.expand_dims(padded, axis=0)
-        return np.ascontiguousarray(tensor), scale, pad_x, pad_y
-
-    def infer_and_detect(self, tensor, scale, pad_x, pad_y, original_shape, offset_x=0, offset_y=0):
-        """Inférence sur un tenseur et retourne les détections avec offset appliqué"""
-        input_data = {self.input_vstream_info.name: tensor}
-        output_data = self.infer_pipeline.infer(input_data)
-
-        detections = []
-        if output_data and self.output_vstream_info.name in output_data:
-            model_output = output_data[self.output_vstream_info.name]
-            dets = self.postproc.process_yolo_output(
-                model_output,
-                conf_threshold=self.conf_threshold,
-                original_shape=original_shape,
-                input_shape=(self.input_height, self.input_width),
-                scale=scale,
-                pad_x=pad_x,
-                pad_y=pad_y
-            )
-            # Appliquer l'offset de la tuile
-            for d in dets:
-                b = d['bbox']
-                d['bbox'] = [b[0]+offset_x, b[1]+offset_y, b[2]+offset_x, b[3]+offset_y]
-                d['center_y'] = (d['bbox'][1] + d['bbox'][3]) // 2
-                detections.append(d)
-        return detections
-
-    def detect_tiled(self, frame):
-        """Découpe le frame en 4 tuiles qui se chevauchent et fusionne les détections"""
-        h, w = frame.shape[:2]
-        all_detections = []
-
-        # 4 tuiles avec 20% de chevauchement
-        overlap = 0.20
-        tiles = [
-            (0,        0,        w//2 + int(w*overlap/2),  h//2 + int(h*overlap/2)),   # haut-gauche
-            (w//2 - int(w*overlap/2), 0, w,                h//2 + int(h*overlap/2)),   # haut-droite
-            (0,        h//2 - int(h*overlap/2), w//2 + int(w*overlap/2), h),           # bas-gauche
-            (w//2 - int(w*overlap/2), h//2 - int(h*overlap/2), w, h),                  # bas-droite
-        ]
-
-        for (x1, y1, x2, y2) in tiles:
-            tile = frame[y1:y2, x1:x2]
-            tile_h, tile_w = tile.shape[:2]
-            tensor, scale, pad_x, pad_y = self.preprocess_single(tile)
-            dets = self.infer_and_detect(
-                tensor, scale, pad_x, pad_y,
-                original_shape=(tile_h, tile_w),
-                offset_x=x1, offset_y=y1
-            )
-            all_detections.extend(dets)
-
-        # NMS global pour supprimer les doublons dans les zones de chevauchement
-        return self.nms(all_detections, iou_threshold=0.4)
-
-    def nms(self, detections, iou_threshold=0.4):
-        """Non-Maximum Suppression pour supprimer les boîtes dupliquées"""
-        if not detections:
-            return []
-
-        boxes = np.array([d['bbox'] for d in detections], dtype=float)
-        scores = np.array([d['conf'] for d in detections])
-
-        x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
-        areas = (x2 - x1) * (y2 - y1)
-        order = scores.argsort()[::-1]
-
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-            ix1 = np.maximum(x1[i], x1[order[1:]])
-            iy1 = np.maximum(y1[i], y1[order[1:]])
-            ix2 = np.minimum(x2[i], x2[order[1:]])
-            iy2 = np.minimum(y2[i], y2[order[1:]])
-            inter = np.maximum(0, ix2-ix1) * np.maximum(0, iy2-iy1)
-            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            order = order[1:][iou < iou_threshold]
-
-        return [detections[i] for i in keep]
-
+        tensor = np.ascontiguousarray(tensor)
+        
+        return tensor, scale, pad_x, pad_y
+    
     def run(self):
         """Boucle principale"""
         if self.is_video_file:
@@ -545,37 +508,37 @@ class CompteurHailoFinal:
         else:
             cap = cv2.VideoCapture(self.input_source)
             source_type = "caméra USB"
-
+        
         if not cap.isOpened():
             print(f"❌ Erreur: impossible d'ouvrir la source {self.input_source}")
             return
-
+        
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps_source = cap.get(cv2.CAP_PROP_FPS)
-
+        
         print(f"📹 Source: {source_type}")
         print(f"📐 Résolution: {width}x{height}")
+        
         if self.is_video_file and fps_source > 0:
-            print(f"⏱️  FPS vidéo: {fps_source:.2f}")
-
+            print(f"⏱️ FPS vidéo: {fps_source:.2f}")
+        
         if self.is_video_file:
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             print(f"📊 Frames totales: {total_frames}")
-
-        # self.tracker.ligne = height // 1.5
+        
         if self.line_y is None:
-            self.tracker.ligne = int(height * 0.67)  # ligne à 2/3 de l'image = zone de passage
+            self.tracker.ligne = height // 2
         else:
             self.tracker.ligne = self.line_y
         print(f"📏 Ligne de comptage: Y={self.tracker.ligne}")
-
+        
         print("🚀 Démarrage du compteur...")
         print("Appuyez sur 'q' pour quitter")
-
+        
         frame_count = 0
         fps_time = time.time()
-
+        
         output_video = None
         if self.is_video_file:
             input_path = Path(self.input_source)
@@ -583,7 +546,7 @@ class CompteurHailoFinal:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             output_video = cv2.VideoWriter(str(output_path), fourcc, 30.0, (width, height))
             print(f"💾 Sauvegarde vidéo: {output_path}")
-
+        
         with self.network_group.activate(self.network_group_params):
             with self.infer_pipeline:
                 while True:
@@ -591,30 +554,57 @@ class CompteurHailoFinal:
                     if not ret:
                         print("🏁 Fin de la vidéo")
                         break
-
+                    
                     frame_count += 1
-
+                    
                     if self.is_video_file and frame_count % 30 == 0:
                         progress = (frame_count / total_frames) * 100
                         print(f"  Progression: {frame_count}/{total_frames} ({progress:.1f}%)")
-
-                    detections = self.detect_tiled(frame)
-
-                    tracked = self.tracker.update(detections)
-
-                    # Dessin
+                    
+                    input_tensor, scale, pad_x, pad_y = self.preprocess(frame)
+                    
+                    try:
+                        input_data = {self.input_vstream_info.name: input_tensor}
+                        
+                        if frame_count == 1:
+                            print(f"  Taille du tenseur d'entrée: {input_tensor.nbytes} bytes")
+                            print(f"  Shape: {input_tensor.shape}")
+                            print(f"  dtype: {input_tensor.dtype}")
+                            print(f"  Min/Max: {input_tensor.min()}/{input_tensor.max()}")
+                            print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
+                        
+                        output_data = self.infer_pipeline.infer(input_data)
+                        
+                    except Exception as e:
+                        print(f"⚠️ Erreur inférence à la frame {frame_count}: {e}")
+                        continue
+                    
+                    detections = []
+                    if output_data and self.output_vstream_info.name in output_data:
+                        model_output = output_data[self.output_vstream_info.name]
+                        detections = self.postproc.process_yolo_output(
+                            model_output,
+                            conf_threshold=self.conf_threshold,
+                            original_shape=(height, width),
+                            input_shape=(self.input_height, self.input_width),
+                            scale=scale,
+                            pad_x=pad_x,
+                            pad_y=pad_y
+                        )
+                    
+                    tracked = self.tracker.update(detections, frame_shape=(height, width))
+                    
                     for track_id, det in tracked:
                         bbox = det['bbox']
                         cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
                         cv2.putText(frame, f"ID:{track_id}", (bbox[0], bbox[1]-10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-                    # cv2.line(frame, (0, self.tracker.ligne), (frame.shape[1], self.tracker.ligne), (0, 255, 0), 2)
-                    cv2.line(frame, (0, int(self.tracker.ligne)), (frame.shape[1], int(self.tracker.ligne)), (0, 255, 0), 2)
-
+                    
+                    cv2.line(frame, (0, self.tracker.ligne), (frame.shape[1], self.tracker.ligne), (0, 255, 0), 2)
+                    
                     cv2.putText(frame, f"Compteur: {self.tracker.compteur}", (10, 50),
                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
+                    
                     if self.is_video_file:
                         cv2.putText(frame, f"Frame: {frame_count}/{total_frames}", (10, 90),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
@@ -625,18 +615,18 @@ class CompteurHailoFinal:
                             fps_time = now
                             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 90),
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-
+                    
                     cv2.putText(frame, f"Détections: {len(detections)}", (10, 130),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
+                    
                     cv2.imshow("Compteur Hailo", frame)
-
+                    
                     if output_video is not None:
                         output_video.write(frame)
-
+                    
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
-
+        
         cap.release()
         if output_video is not None:
             output_video.release()
@@ -644,10 +634,10 @@ class CompteurHailoFinal:
         cv2.destroyAllWindows()
         if self.vdevice:
             self.vdevice.release()
-
+        
         self.sauvegarder_compte()
         print(f"💾 Compteur final: {self.tracker.compteur}")
-
+    
     def sauvegarder_compte(self):
         data = {
             "personnes": self.tracker.compteur,
@@ -666,9 +656,9 @@ def trouver_hef_detection():
         str(Path.home() / "hailo-rpi5-examples/resources"),
         "."
     ]
-
+    
     print("🔍 Recherche d'un modèle de détection...")
-
+    
     model_preferences = [
         "yolov8s.hef",
         "yolov8n.hef",
@@ -677,7 +667,7 @@ def trouver_hef_detection():
         "yolov7.hef",
         "yolov6n.hef"
     ]
-
+    
     for base in base_paths:
         if os.path.exists(base):
             for model in model_preferences:
@@ -685,27 +675,23 @@ def trouver_hef_detection():
                 if os.path.exists(full_path):
                     print(f"✅ Modèle trouvé: {full_path}")
                     return full_path
-
+    
     return None
 
 def main():
     parser = argparse.ArgumentParser(description="Compteur de personnes avec Hailo")
     parser.add_argument('--input', '-i', default='0',
                        help='Source d\'entrée: 0 pour caméra USB, ou chemin vers fichier vidéo')
+    parser.add_argument('--conf', '-c', type=float, default=0.5,
+                       help='Seuil de confiance pour les détections (défaut: 0.5)')
     parser.add_argument('--line', '-l', type=int, default=None,
                        help='Position Y de la ligne de comptage (défaut: milieu de l\'image)')
-    parser.add_argument('--iou', type=float, default=0.4,
-                   help='Seuil IoU pour NMS (défaut: 0.4)')
-    parser.add_argument('--conf', '-c', type=float, default=0.3,
-                    help='Seuil de confiance (défaut: 0.3)')
-    parser.add_argument('--kalman', action='store_true',
-                    help='Activer le filtre de Kalman')
-
+    
     args = parser.parse_args()
-
+    
     print(f"📦 Numpy version: {np.__version__}")
     print(f"🎯 Seuil de confiance: {args.conf}")
-
+    
     if args.input == '0' or args.input.lower() == 'usb':
         input_source = 0
         print("📹 Source: Caméra USB")
@@ -716,13 +702,13 @@ def main():
         else:
             print(f"❌ Fichier vidéo non trouvé: {input_source}")
             return
-
+    
     hef_path = trouver_hef_detection()
-
+    
     if not hef_path:
         print("\n❌ Aucun modèle trouvé!")
         return
-
+    
     try:
         app = CompteurHailoFinal(hef_path, input_source, args.conf, args.line)
         app.run()
