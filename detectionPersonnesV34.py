@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-compteur_hailo_v36.py
+compteur_hailo_v38.py
 
 Format de sortie Hailo NMS BY CLASS (FLOAT32) pour yolov8n.hef :
   Buffer max 2004 bytes = 501 floats, structuré par classe :
@@ -34,13 +34,7 @@ except ImportError as e:
     exit(1)
 
 class YOLOPostProcess:
-    """Post-processing pour yolov8n.hef - format HAILO NMS BY CLASS (FLOAT32)
-
-    Le buffer de sortie est structuré ainsi (1 classe, max 100 bbox) :
-      [num_detections, y_min_0, x_min_0, y_max_0, x_max_0, score_0, ...]
-    Coordonnées normalisées [0,1], ordre Y avant X.
-    Le NMS est déjà effectué par le hardware Hailo.
-    """
+    """Post-processing pour yolov8n.hef - Format concaténé sans compteur"""
 
     def __init__(self):
         self.debug_done = False
@@ -48,7 +42,7 @@ class YOLOPostProcess:
     def process_yolo_output(self, output, conf_threshold=0.5,
                        input_shape=(320,320), original_shape=(960,540),
                        scale=1.0, pad_x=0, pad_y=0):
-        """Parse le buffer HAILO NMS BY CLASS et convertit vers l'espace image originale."""
+        """Parse le buffer de sortie (détections concaténées)"""
         detections = []
 
         if output is None:
@@ -58,26 +52,26 @@ class YOLOPostProcess:
             # Convertir en ndarray et aplatir en 1D
             raw = np.array(output).flatten().astype(np.float32)
 
-            if not self.debug_done:
-                print(f"\n🔍 DEBUG - Buffer brut: {raw.shape[0]} floats")
-                print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
-                print(f"  Premiers floats: {raw[:16]}")
-
-            # Premier float = nombre de détections
             if raw.size == 0:
-                if not self.debug_done:
-                    print(f"\n🔍 DEBUG - Buffer vide, aucune détection")
                 return detections
 
             if not self.debug_done:
-                print(f"  Nombre de détections: {num_detections}")
+                print(f"\n🔍 DEBUG - Buffer brut: {raw.shape[0]} floats")
+                print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
+                print(f"  raw: {raw}")
+                print(f"  raw[0] = {raw[0]:.3f}")
+
+            # Format: toutes les détections concaténées, chaque détection = 5 floats
+            # [y_min, x_min, y_max, x_max, score] répété
+            num_detections = raw.shape[0] // 5
+            
+            if not self.debug_done:
+                print(f"  Nombre de détections (déduit): {num_detections}")
 
             # Chaque détection = 5 floats : y_min, x_min, y_max, x_max, score
             for i in range(num_detections):
-                offset = 1 + i * 5
-                if offset + 5 > raw.shape[0]:
-                    break
-
+                offset = i * 5
+                
                 y_min_n = float(raw[offset + 0])
                 x_min_n = float(raw[offset + 1])
                 y_max_n = float(raw[offset + 2])
@@ -87,19 +81,19 @@ class YOLOPostProcess:
                 if score < conf_threshold:
                     continue
 
-                # Coordonnées normalisées → pixels dans l'espace paddé (input_shape)
+                # Coordonnées normalisées → pixels dans l'espace paddé
                 x1p = x_min_n * input_shape[1]
                 y1p = y_min_n * input_shape[0]
                 x2p = x_max_n * input_shape[1]
                 y2p = y_max_n * input_shape[0]
 
-                # Enlever le padding → espace image redimensionnée
+                # Enlever le padding
                 x1p -= pad_x
                 y1p -= pad_y
                 x2p -= pad_x
                 y2p -= pad_y
 
-                # Appliquer l'échelle inverse → espace image originale
+                # Appliquer l'échelle inverse
                 x1 = int(x1p / scale)
                 y1 = int(y1p / scale)
                 x2 = int(x2p / scale)
