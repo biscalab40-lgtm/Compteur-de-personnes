@@ -131,110 +131,235 @@ class YOLOPostProcess:
 
         return detections
 
-class TrajectoryTracker:
-    """Tracker centroïde robuste avec comptage de franchissement de ligne"""
+class TemporalSmoother:
+    """Lisse les détections sur plusieurs frames pour stabiliser les trajectoires"""
+    
+    def __init__(self, history_size=5, original_shape=(540, 960)):
+        """
+        Args:
+            history_size: nombre de frames à garder en mémoire pour le lissage
+            original_shape: dimensions de l'image (hauteur, largeur) pour validation
+        """
+        self.history = {}  # track_id -> liste de (bbox, conf)
+        self.history_size = history_size
+        self.original_shape = original_shape  # (height, width)
+    
+    def update_shape(self, height, width):
+        """Met à jour les dimensions de l'image (appelé à chaque frame si besoin)"""
+        self.original_shape = (height, width)
+    
+    def smooth(self, track_id, bbox, conf):
+        """
+        Ajoute une nouvelle détection et retourne la version lissée
+        
+        Args:
+            track_id: identifiant unique de la piste
+            bbox: [x1, y1, x2, y2]
+            conf: score de confiance
+            
+        Returns:
+            tuple: (bbox_lissé, conf_lissée)
+        """
+        # Initialiser l'historique pour ce track si nécessaire
+        if track_id not in self.history:
+            self.history[track_id] = []
+        
+        # Ajouter la nouvelle détection
+        self.history[track_id].append((bbox, conf))
+        
+        # Limiter la taille de l'historique
+        if len(self.history[track_id]) > self.history_size:
+            self.history[track_id].pop(0)
+        
+        # Si on a assez d'historique, on lisse
+        if len(self.history[track_id]) >= 3:
+            # Prendre les 3 dernières détections
+            recent = self.history[track_id][-3:]
+            
+            # Moyenne pondérée par la confiance
+            total_conf = sum(b[1] for b in recent)
+            if total_conf > 0:
+                # Moyenne des coordonnées pondérée par la confiance
+                avg_bbox = [
+                    int(sum(b[0][0] * b[1] for b in recent) / total_conf),  # x1
+                    int(sum(b[0][1] * b[1] for b in recent) / total_conf),  # y1
+                    int(sum(b[0][2] * b[1] for b in recent) / total_conf),  # x2
+                    int(sum(b[0][3] * b[1] for b in recent) / total_conf)   # y2
+                ]
+                avg_conf = total_conf / len(recent)
+            else:
+                # Fallback si confiances nulles
+                avg_bbox = [
+                    int(sum(b[0][0] for b in recent) / len(recent)),
+                    int(sum(b[0][1] for b in recent) / len(recent)),
+                    int(sum(b[0][2] for b in recent) / len(recent)),
+                    int(sum(b[0][3] for b in recent) / len(recent))
+                ]
+                avg_conf = conf
+            
+            # Vérifier que la boîte lissée a une taille raisonnable
+            w = avg_bbox[2] - avg_bbox[0]
+            h = avg_bbox[3] - avg_bbox[1]
+            
+            # Si la boîte lissée est trop déformée ou hors limites, on garde l'originale
+            if (w < 10 or h < 20 or 
+                w > self.original_shape[1] or 
+                h > self.original_shape[0] or
+                avg_bbox[0] < 0 or avg_bbox[1] < 0 or
+                avg_bbox[2] > self.original_shape[1] or
+                avg_bbox[3] > self.original_shape[0]):
+                return bbox, conf
+            
+            return avg_bbox, avg_conf
+        else:
+            # Pas assez d'historique, on retourne la détection brute
+            return bbox, conf
+    
+    def cleanup(self, active_tracks):
+        """
+        Nettoie l'historique des tracks qui ne sont plus actifs
+        
+        Args:
+            active_tracks: liste des IDs de tracks actuellement suivis
+        """
+        to_remove = []
+        for track_id in self.history:
+            if track_id not in active_tracks:
+                to_remove.append(track_id)
+        
+        for track_id in to_remove:
+            del self.history[track_id]
 
+class TrajectoryTracker:
+    """Tracker ultra-robuste avec filtrage temporel et Kalman"""
+    
     def __init__(self, ligne_centrale=300):
         self.ligne = ligne_centrale
         self.compteur = 0
         self.next_id = 0
-
-        # Données par track : {id: {'bbox', 'center', 'side', 'lost', 'counted'}}
         self.tracks = {}
-
-        # Distance max en pixels pour associer une détection à un track existant
-        self.max_dist = 80
-        # Frames avant de supprimer un track perdu
+        
+        # Initialiser le smoother (les dimensions seront mises à jour à la première frame)
+        self.smoother = TemporalSmoother(history_size=5, original_shape=(540, 960))
+        
+        # Paramètres optimisés
+        self.iou_threshold = 0.3
         self.max_lost = 8
-
-    def _center(self, bbox):
-        return ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
-
-    def _dist(self, c1, c2):
-        return np.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
-
-    def _side(self, cy):
-        """Retourne 'above' ou 'below' selon la position par rapport à la ligne"""
-        return 'below' if cy > self.ligne else 'above'
-
-    def update(self, detections):
-        # --- Association détections → tracks existants (distance centroïde) ---
-        matched_track_ids = set()
-        matched_det_indices = set()
-        assignments = {}  # det_idx → track_id
-
-        det_centers = [self._center(d['bbox']) for d in detections]
-
-        for track_id, track in self.tracks.items():
-            if not detections:
-                break
-            best_dist = self.max_dist
-            best_idx = None
-            for i, dc in enumerate(det_centers):
-                if i in matched_det_indices:
-                    continue
-                d = self._dist(dc, track['center'])
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = i
-            if best_idx is not None:
-                assignments[best_idx] = track_id
-                matched_track_ids.add(track_id)
-                matched_det_indices.add(best_idx)
-
-        # --- Mettre à jour les tracks associés ---
-        for det_idx, track_id in assignments.items():
+        self.kalman_enabled = True
+        self.min_confidence = 0.3
+    
+    def update(self, detections, frame_shape=None):
+        """
+        Met à jour le tracking avec les nouvelles détections
+        
+        Args:
+            detections: liste des détections de la frame courante
+            frame_shape: (hauteur, largeur) de la frame courante
+        """
+        # Mettre à jour les dimensions de l'image si fournies
+        if frame_shape is not None:
+            self.smoother.update_shape(frame_shape[0], frame_shape[1])
+        
+        # ... (suite du code existant)
+        
+        # Mettre à jour la résolution de l'image si disponible
+        if detections and 'original_shape' in detections[0]:
+            self.original_shape = detections[0]['original_shape']
+        
+        # Associer détections ↔ tracks
+        matched, unmatched_det, unmatched_track = self._associate(detections)
+        
+        # Mettre à jour les tracks associés
+        for det_idx, track_id in matched.items():
             det = detections[det_idx]
-            cx, cy = det_centers[det_idx]
-            new_side = self._side(cy)
+            
+            # LISSAGE TEMPOREL - Application
+            smooth_bbox, smooth_conf = self.smoother.smooth(
+                track_id, det['bbox'], det['conf']
+            )
+            
+            # Si la confiance lissée est trop basse, on garde quand même ?
+            # On utilise le max des deux confiances pour être conservateur
+            effective_conf = max(smooth_conf, det['conf'])
+            if effective_conf < self.min_confidence:
+                continue
+            
+            cx = (smooth_bbox[0] + smooth_bbox[2]) // 2
+            cy = (smooth_bbox[1] + smooth_bbox[3]) // 2
+            
+            # Vérifier le franchissement de ligne
             old_side = self.tracks[track_id]['side']
-
-            # Franchissement détecté : above→below OU below→above
+            new_side = 'below' if cy > self.ligne else 'above'
+            
             if old_side != new_side and not self.tracks[track_id]['counted']:
                 self.compteur += 1
                 self.tracks[track_id]['counted'] = True
-                print(f"✅ Personne {track_id} a franchi la ligne! Total: {self.compteur}")
-
+                print(f"✅ Personne {track_id} comptée! Total: {self.compteur}")
+            
+            # Mettre à jour les données
             self.tracks[track_id].update({
-                'bbox': det['bbox'],
+                'bbox': smooth_bbox,  # Utiliser la version lissée
                 'center': (cx, cy),
                 'side': new_side,
                 'lost': 0,
+                'last_seen': time.time(),
+                'confidence': effective_conf
             })
-
-        # --- Créer de nouveaux tracks pour les détections non associées ---
-        for i, det in enumerate(detections):
-            if i not in matched_det_indices:
-                cx, cy = det_centers[i]
-                self.tracks[self.next_id] = {
-                    'bbox': det['bbox'],
-                    'center': (cx, cy),
-                    'side': self._side(cy),
-                    'lost': 0,
-                    'counted': False,
-                }
-                self.next_id += 1
-
-        # --- Incrémenter lost pour les tracks non mis à jour, supprimer les vieux ---
+            
+            # Mettre à jour Kalman
+            self._update_kalman(track_id, (cx, cy))
+        
+        # Créer nouveaux tracks
+        for det_idx in unmatched_det:
+            det = detections[det_idx]
+            if det['conf'] < self.min_confidence:
+                continue
+                
+            cx = (det['bbox'][0] + det['bbox'][2]) // 2
+            cy = (det['bbox'][1] + det['bbox'][3]) // 2
+            
+            self.tracks[self.next_id] = {
+                'bbox': det['bbox'],
+                'center': (cx, cy),
+                'side': 'below' if cy > self.ligne else 'above',
+                'lost': 0,
+                'counted': False,
+                'last_seen': time.time(),
+                'confidence': det['conf'],
+                'kalman': self._init_kalman(det['bbox'])
+            }
+            
+            # Initialiser le smoother pour ce nouveau track
+            self.smoother.smooth(self.next_id, det['bbox'], det['conf'])
+            self.next_id += 1
+        
+        # Nettoyer les tracks perdus
         to_delete = []
-        for track_id in self.tracks:
-            if track_id not in matched_track_ids:
-                self.tracks[track_id]['lost'] += 1
-                if self.tracks[track_id]['lost'] > self.max_lost:
-                    to_delete.append(track_id)
+        for track_id, track in self.tracks.items():
+            if track['lost'] > self.max_lost:
+                to_delete.append(track_id)
+        
+        # Nettoyer le smoother avant de supprimer les tracks
+        active_tracks = set(self.tracks.keys()) - set(to_delete)
+        self.smoother.cleanup(active_tracks)
+        
         for tid in to_delete:
             del self.tracks[tid]
-
-        # --- Retourner les tracks actifs pour le dessin ---
+        
+        # Retourner les tracks actifs
         current_tracks = []
         for track_id, track in self.tracks.items():
             if track['lost'] == 0:
-                # Reconstruire un det-like pour compatibilité avec le dessin
-                det = {'bbox': track['bbox'], 'center_y': track['center'][1]}
+                # Utiliser la bbox Kalman si disponible, sinon la bbox lissée
+                if 'kalman_bbox' in track:
+                    bbox = track['kalman_bbox']
+                else:
+                    bbox = track['bbox']
+                det = {'bbox': bbox, 'center_y': track['center'][1]}
                 current_tracks.append((track_id, det))
-
+        
         return current_tracks
-
+    
 class CompteurHailoFinal:
     """Application principale"""
 
@@ -567,10 +692,14 @@ def main():
     parser = argparse.ArgumentParser(description="Compteur de personnes avec Hailo")
     parser.add_argument('--input', '-i', default='0',
                        help='Source d\'entrée: 0 pour caméra USB, ou chemin vers fichier vidéo')
-    parser.add_argument('--conf', '-c', type=float, default=0.5,
-                       help='Seuil de confiance pour les détections (défaut: 0.5)')
     parser.add_argument('--line', '-l', type=int, default=None,
                        help='Position Y de la ligne de comptage (défaut: milieu de l\'image)')
+    parser.add_argument('--iou', type=float, default=0.4,
+                   help='Seuil IoU pour NMS (défaut: 0.4)')
+    parser.add_argument('--conf', '-c', type=float, default=0.3,
+                    help='Seuil de confiance (défaut: 0.3)')
+    parser.add_argument('--kalman', action='store_true',
+                    help='Activer le filtre de Kalman')
 
     args = parser.parse_args()
 
