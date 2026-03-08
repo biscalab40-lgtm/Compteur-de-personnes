@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-compteur_hailo_v35.py
+compteur_hailo_v36.py
 
 Format de sortie Hailo NMS BY CLASS (FLOAT32) pour yolov8n.hef :
   Buffer max 2004 bytes = 501 floats, structuré par classe :
@@ -64,7 +64,10 @@ class YOLOPostProcess:
                 print(f"  Premiers floats: {raw[:16]}")
 
             # Premier float = nombre de détections
-            num_detections = int(raw[0])
+            if raw.size == 0:
+                if not self.debug_done:
+                    print(f"\n🔍 DEBUG - Buffer vide, aucune détection")
+                return detections
 
             if not self.debug_done:
                 print(f"  Nombre de détections: {num_detections}")
