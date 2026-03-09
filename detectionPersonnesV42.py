@@ -191,110 +191,176 @@ class TemporalSmoother:
             del self.history[tid]
 
 class TrajectoryTracker:
-    """Tracker avec logique de franchissement de ligne vectorielle et directionnelle"""
+    """Tracker complet avec intersection de segments (In/Out) et Kalman Filter"""
     
     def __init__(self, ligne_coords=None):
-        # ligne_coords: ((x1, y1), (x2, y2))
-        self.ligne = ligne_coords 
-        self.cnt_in = 0   # Entrées (ex: vers le bas)
-        self.cnt_out = 0  # Sorties (ex: vers le haut)
+        self.ligne = ligne_coords # Format: ((x1, y1), (x2, y2))
+        self.cnt_in = 0
+        self.cnt_out = 0
         self.next_id = 0
         self.tracks = {}
         
         self.smoother = TemporalSmoother(history_size=5)
         self.iou_threshold = 0.3
         self.max_lost = 10
+        self.kalman_enabled = True
         self.min_confidence = 0.3
 
+    def _init_kalman(self, bbox):
+        kf = cv2.KalmanFilter(6, 2)
+        kf.measurementMatrix = np.array([[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0]], np.float32)
+        kf.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0], [0, 1, 0, 0, 0, 1], [0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1]
+        ], np.float32)
+        kf.processNoiseCov = np.eye(6, dtype=np.float32) * 0.01
+        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        kf.statePre = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
+        kf.statePost = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
+        return kf
+
     def _ccw(self, A, B, C):
-        """Vérifie l'orientation des points (Counter-Clockwise)"""
         return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
 
     def _intersect(self, A, B, C, D):
-        """Vérifie si le segment [AB] traverse le segment [CD]"""
+        """Algorithme d'intersection de segments (A-B traverse C-D)"""
         return self._ccw(A, C, D) != self._ccw(B, C, D) and \
                self._ccw(A, B, C) != self._ccw(A, B, D)
 
+    def _compute_iou(self, box1, box2):
+        x1, y1 = max(box1[0], box2[0]), max(box1[1], box2[1])
+        x2, y2 = min(box1[2], box2[2]), min(box1[3], box2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - inter
+        return inter / union if union > 0 else 0
+
+    def _predict(self):
+        for tid in self.tracks:
+            if self.kalman_enabled and self.tracks[tid]['kalman'] is not None:
+                predicted = self.tracks[tid]['kalman'].predict()
+                cx, cy = predicted[0,0], predicted[1,0]
+                w = self.tracks[tid]['bbox'][2] - self.tracks[tid]['bbox'][0]
+                h = self.tracks[tid]['bbox'][3] - self.tracks[tid]['bbox'][1]
+                self.tracks[tid]['predicted_bbox'] = [int(cx-w//2), int(cy-h//2), int(cx+w//2), int(cy+h//2)]
+
+    def _associate(self, detections):
+        if not self.tracks or not detections:
+            return {}, list(range(len(detections))), list(self.tracks.keys())
+        
+        t_ids = list(self.tracks.keys())
+        iou_matrix = np.zeros((len(t_ids), len(detections)))
+        for t_idx, tid in enumerate(t_ids):
+            target_box = self.tracks[tid].get('predicted_bbox', self.tracks[tid]['bbox'])
+            for d_idx, det in enumerate(detections):
+                iou_matrix[t_idx, d_idx] = self._compute_iou(target_box, det['bbox'])
+        
+        matched, unmatched_det = {}, list(range(len(detections)))
+        unmatched_track = list(range(len(t_ids)))
+        
+        while True:
+            max_val = np.max(iou_matrix) if iou_matrix.size > 0 else 0
+            # si IoU insuffisant, essayer la distance centroïde
+            if max_val < self.iou_threshold:
+                # Fallback : associer par distance centroïde (max 80px)
+                for t_idx, tid in enumerate(t_ids):
+                    if t_idx not in unmatched_track:
+                        continue
+                    tc = self.tracks[tid]['center']
+                    for d_idx in unmatched_det:
+                        dc = ((detections[d_idx]['bbox'][0]+detections[d_idx]['bbox'][2])//2,
+                              (detections[d_idx]['bbox'][1]+detections[d_idx]['bbox'][3])//2)
+                        if np.sqrt((tc[0]-dc[0])**2+(tc[1]-dc[1])**2) < 80:
+                            matched[d_idx] = tid
+                            unmatched_track.remove(t_idx)
+                            unmatched_det.remove(d_idx)
+                            break
+                break
+            t_idx, d_idx = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
+            matched[d_idx] = t_ids[t_idx]
+            iou_matrix[t_idx, :] = -1
+            iou_matrix[:, d_idx] = -1
+            if t_idx in unmatched_track: unmatched_track.remove(t_idx)
+            if d_idx in unmatched_det: unmatched_det.remove(d_idx)
+            
+        return matched, unmatched_det, [t_ids[i] for i in unmatched_track]
+
     def update(self, detections, frame_shape=None):
-        if frame_shape is not None and self.ligne is None:
-            # Par défaut : ligne horizontale au milieu
-            mid_y = frame_shape[0] // 2
-            self.ligne = ((0, mid_y), (frame_shape[1], mid_y))
+        if frame_shape is not None:
+            h, w = frame_shape[0], frame_shape[1]
+            if self.ligne is None or isinstance(self.ligne, int):
+                y_pos = self.ligne if isinstance(self.ligne, int) else h // 2
+                self.ligne = ((0, y_pos), (w, y_pos))
+            self.smoother.update_shape(h, w)
 
         self._predict()
         matched, unmatched_det, unmatched_track = self._associate(detections)
-        
-        for det_idx, track_id in matched.items():
-            det = detections[det_idx]
-            smooth_bbox, _ = self.smoother.smooth(track_id, det['bbox'], det['conf'])
-            
-            new_center = ((smooth_bbox[0] + smooth_bbox[2]) // 2, 
-                          (smooth_bbox[1] + smooth_bbox[3]) // 2)
-            
-            old_center = self.tracks[track_id]['center']
-            
-            # LOGIQUE DE FRANCHISSEMENT
-            if not self.tracks[track_id]['counted']:
+
+        # Update existing tracks
+        for d_idx, tid in matched.items():
+            det = detections[d_idx]
+            smooth_bbox, _ = self.smoother.smooth(tid, det['bbox'], det['conf'])
+
+            # new_center calculé EN PREMIER
+            new_center = ((smooth_bbox[0]+smooth_bbox[2])//2, (smooth_bbox[1]+smooth_bbox[3])//2)
+            old_center = self.tracks[tid]['center']
+
+            # Reset counted si la personne a changé de côté (demi-tour)
+            current_side = 'below' if new_center[1] > self.ligne[0][1] else 'above'
+            if self.tracks[tid].get('last_side') and self.tracks[tid]['last_side'] != current_side:
+                self.tracks[tid]['counted'] = False
+
+            # Détection du franchissement
+            if not self.tracks[tid]['counted']:
                 if self._intersect(old_center, new_center, self.ligne[0], self.ligne[1]):
-                    # Déterminer la direction (In vs Out)
-                    # Si y augmente, on descend (Entrée), si y diminue, on monte (Sortie)
                     if new_center[1] > old_center[1]:
                         self.cnt_in += 1
-                        direction = "IN"
+                        print(f"➡️ Entrée! Total IN: {self.cnt_in}")
                     else:
                         self.cnt_out += 1
-                        direction = "OUT"
-                    
-                    self.tracks[track_id]['counted'] = True
-                    print(f"✅ Personne {track_id} : {direction} | Total: In={self.cnt_in}, Out={self.cnt_out}")
+                        print(f"⬅️ Sortie! Total OUT: {self.cnt_out}")
+                    self.tracks[tid]['counted'] = True
+                    self.tracks[tid]['last_side'] = current_side
 
-            self.tracks[track_id].update({
+            self.tracks[tid].update({
                 'bbox': smooth_bbox,
                 'center': new_center,
-                'lost': 0
+                'lost': 0,
+                'last_side': current_side
             })
-            
-        # ... (le reste de la logique de création/suppression de tracks reste identique)
-            self._update_kalman(track_id, (cx, cy))
-        
-        for det_idx in unmatched_det:
-            det = detections[det_idx]
+            if self.kalman_enabled:
+                self.tracks[tid]['kalman'].correct(
+                    np.array([[new_center[0]], [new_center[1]]], np.float32)
+                )
+
+        # New detections
+        for d_idx in unmatched_det:
+            det = detections[d_idx]
             if det['conf'] < self.min_confidence:
                 continue
-            
-            cx = (det['bbox'][0] + det['bbox'][2]) // 2
-            cy = (det['bbox'][1] + det['bbox'][3]) // 2
-            
+            cx = (det['bbox'][0]+det['bbox'][2])//2
+            cy = (det['bbox'][1]+det['bbox'][3])//2
+            side = 'below' if cy > self.ligne[0][1] else 'above'
             self.tracks[self.next_id] = {
                 'bbox': det['bbox'],
                 'center': (cx, cy),
-                'side': 'below' if cy > self.ligne else 'above',
                 'lost': 0,
                 'counted': False,
-                'last_seen': time.time(),
+                'last_side': side,
                 'kalman': self._init_kalman(det['bbox'])
             }
-            self.smoother.smooth(self.next_id, det['bbox'], det['conf'])
             self.next_id += 1
-        
-        for track_id in unmatched_track:
-            self.tracks[track_id]['lost'] += 1
-        
-        to_delete = [tid for tid, track in self.tracks.items() if track['lost'] > self.max_lost]
-        active_tracks = set(self.tracks.keys()) - set(to_delete)
-        self.smoother.cleanup(active_tracks)
-        
-        for tid in to_delete:
+
+        # Cleanup lost tracks
+        for tid in unmatched_track:
+            self.tracks[tid]['lost'] += 1
+        to_del = [tid for tid, t in self.tracks.items() if t['lost'] > self.max_lost]
+        for tid in to_del:
             del self.tracks[tid]
-        
-        current_tracks = []
-        for track_id, track in self.tracks.items():
-            if track['lost'] == 0:
-                bbox = track.get('kalman_bbox', track['bbox'])
-                det = {'bbox': bbox, 'center_y': track['center'][1]}
-                current_tracks.append((track_id, det))
-        
-        return current_tracks
+
+        return [(tid, {'bbox': t['bbox']}) for tid, t in self.tracks.items() if t['lost'] == 0]
 
 class CompteurHailoFinal:
     """Application principale"""
@@ -402,6 +468,74 @@ class CompteurHailoFinal:
         
         return tensor, scale, pad_x, pad_y
     
+    def preprocess_single(self, frame):
+        h, w = frame.shape[:2]
+        scale = min(self.input_width / w, self.input_height / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(frame, (new_w, new_h))
+        pad_x = (self.input_width - new_w) // 2
+        pad_y = (self.input_height - new_h) // 2
+        padded = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
+        padded[pad_y:pad_y+new_h, pad_x:pad_x+new_w] = resized
+        return np.ascontiguousarray(np.expand_dims(padded, 0)), scale, pad_x, pad_y
+
+    def infer_tile(self, tensor, scale, pad_x, pad_y, tile_shape, offset_x, offset_y):
+        input_data = {self.input_vstream_info.name: tensor}
+        output_data = self.infer_pipeline.infer(input_data)
+        dets = []
+        if output_data and self.output_vstream_info.name in output_data:
+            dets = self.postproc.process_yolo_output(
+                output_data[self.output_vstream_info.name],
+                conf_threshold=self.conf_threshold,
+                original_shape=tile_shape,
+                input_shape=(self.input_height, self.input_width),
+                scale=scale, pad_x=pad_x, pad_y=pad_y
+            )
+            for d in dets:
+                b = d['bbox']
+                d['bbox'] = [b[0]+offset_x, b[1]+offset_y, b[2]+offset_x, b[3]+offset_y]
+                d['center_y'] = (d['bbox'][1] + d['bbox'][3]) // 2
+        return dets
+
+    def detect_tiled(self, frame):
+        h, w = frame.shape[:2]
+        cols, rows = (3, 2) if w >= 1280 else (2, 2)
+        overlap = 0.15
+        tw, th = w // cols, h // rows
+        pw, ph = int(tw * overlap), int(th * overlap)
+        all_dets = []
+        for row in range(rows):
+            for col in range(cols):
+                x1 = max(0, col * tw - pw)
+                y1 = max(0, row * th - ph)
+                x2 = min(w, (col+1) * tw + pw)
+                y2 = min(h, (row+1) * th + ph)
+                tile = frame[y1:y2, x1:x2]
+                tensor, scale, px, py = self.preprocess_single(tile)
+                dets = self.infer_tile(tensor, scale, px, py, tile.shape[:2], x1, y1)
+                all_dets.extend(dets)
+        return self.nms(all_dets)
+
+    def nms(self, detections, iou_threshold=0.4):
+        if not detections:
+            return []
+        boxes = np.array([d['bbox'] for d in detections], dtype=float)
+        scores = np.array([d['conf'] for d in detections])
+        x1,y1,x2,y2 = boxes[:,0],boxes[:,1],boxes[:,2],boxes[:,3]
+        areas = (x2-x1)*(y2-y1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]; keep.append(i)
+            ix1 = np.maximum(x1[i], x1[order[1:]])
+            iy1 = np.maximum(y1[i], y1[order[1:]])
+            ix2 = np.minimum(x2[i], x2[order[1:]])
+            iy2 = np.minimum(y2[i], y2[order[1:]])
+            inter = np.maximum(0,ix2-ix1)*np.maximum(0,iy2-iy1)
+            iou = inter/(areas[i]+areas[order[1:]]-inter+1e-6)
+            order = order[1:][iou < iou_threshold]
+        return [detections[i] for i in keep]
+    
     def run(self):
         """Boucle principale"""
         if self.is_video_file:
@@ -463,44 +597,20 @@ class CompteurHailoFinal:
                         progress = (frame_count / total_frames) * 100
                         print(f"  Progression: {frame_count}/{total_frames} ({progress:.1f}%)")
                     
-                    input_tensor, scale, pad_x, pad_y = self.preprocess(frame)
-                    
-                    try:
-                        input_data = {self.input_vstream_info.name: input_tensor}
-                        
-                        if frame_count == 1:
-                            print(f"  Taille du tenseur d'entrée: {input_tensor.nbytes} bytes")
-                            print(f"  Shape: {input_tensor.shape}")
-                            print(f"  dtype: {input_tensor.dtype}")
-                            print(f"  Min/Max: {input_tensor.min()}/{input_tensor.max()}")
-                            print(f"  Scale: {scale:.3f}, Pad: ({pad_x}, {pad_y})")
-                        
-                        output_data = self.infer_pipeline.infer(input_data)
-                        
-                    except Exception as e:
-                        print(f"⚠️ Erreur inférence à la frame {frame_count}: {e}")
-                        continue
-                    
-                    detections = []
-                    if output_data and self.output_vstream_info.name in output_data:
-                        model_output = output_data[self.output_vstream_info.name]
-                        detections = self.postproc.process_yolo_output(
-                            model_output,
-                            conf_threshold=self.conf_threshold,
-                            original_shape=(height, width),
-                            input_shape=(self.input_height, self.input_width),
-                            scale=scale,
-                            pad_x=pad_x,
-                            pad_y=pad_y
-                        )
+                    detections = self.detect_tiled(frame)
                     
                     tracked = self.tracker.update(detections, frame_shape=(height, width))
                     
                     for track_id, det in tracked:
                         bbox = det['bbox']
-                        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
+                        # Couleur selon statut : vert = pas encore compté, bleu = compté
+                        is_counted = self.tracker.tracks.get(track_id, {}).get('counted', False)
+                        color = (0, 0, 255) if is_counted else (0, 255, 0)  # bleu ou vert
+                        label_color = (255, 100, 0) if is_counted else (255, 255, 0)
+                        
+                        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
                         cv2.putText(frame, f"ID:{track_id}", (bbox[0], bbox[1]-10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 1)
                     
                     cv2.line(frame, self.tracker.ligne[0], self.tracker.ligne[1], (0, 255, 255), 3)
                     
@@ -515,7 +625,7 @@ class CompteurHailoFinal:
                                 cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 2)
                     
                     if self.is_video_file:
-                        cv2.putText(frame, f"Frame: {frame_count}/{total_frames}", (10, 90),
+                        cv2.putText(frame, f"Frame: {frame_count}/{total_frames}", (10, 125),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
                     else:
                         if frame_count % 30 == 0:
@@ -545,18 +655,24 @@ class CompteurHailoFinal:
             self.vdevice.release()
         
         self.sauvegarder_compte()
-        print(f"💾 Compteur final: {self.tracker.compteur}")
+        print(f"entrees: {self.tracker.cnt_in}")
+        print(f"sorties: {self.tracker.cnt_out}")
     
     def sauvegarder_compte(self):
         data = {
-            "personnes": self.tracker.compteur,
-            "timestamp": time.time(),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "entrees": self.tracker.cnt_in,
+            "sorties": self.tracker.cnt_out,
+            "total_passage": self.tracker.cnt_in + self.tracker.cnt_out,
             "modele": os.path.basename(self.hef_path),
             "source": str(self.input_source),
             "conf_threshold": self.conf_threshold
         }
-        with open("compte_personnes.json", 'w') as f:
-            json.dump(data, f, indent=4)
+        try:
+            with open("compteur_stats.json", "w") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Erreur sauvegarde: {e}")
 
 def trouver_hef_detection():
     base_paths = [
