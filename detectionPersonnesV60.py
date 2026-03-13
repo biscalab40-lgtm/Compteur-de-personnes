@@ -20,6 +20,7 @@ line_zone = None
 LINE_X_RATIO = 0.5
 DIRECTION = "ltr"      # "ltr" = gauche vers droite, "rtl" = droite vers gauche
 ROI = None             # None ou (x1, y1, x2, y2) en pixels
+MIRROR = False         # Retourner l'image horizontalement
 
 # -----------------------------------------------------------------------------------------------
 # Classe callback utilisateur
@@ -138,15 +139,31 @@ def app_callback(pad, info, user_data):
 
     # Affichage
     if frame is not None:
+        # Miroir horizontal si active
+        if MIRROR:
+            frame = cv2.flip(frame, 1)
+            # Fonction pour inverser les coordonnees X
+            def fx(x):
+                return int(width - 1 - x)
+        else:
+            def fx(x):
+                return int(x)
+
         # ROI (rectangle magenta)
         if ROI is not None:
-            cv2.rectangle(frame, (ROI[0], ROI[1]), (ROI[2], ROI[3]), (255, 0, 255), 2)
-            cv2.putText(frame, "ROI", (ROI[0] + 5, ROI[1] + 20),
+            rx1, rx2 = fx(ROI[0]), fx(ROI[2])
+            if rx1 > rx2:
+                rx1, rx2 = rx2, rx1
+            cv2.rectangle(frame, (rx1, ROI[1]), (rx2, ROI[3]), (255, 0, 255), 2)
+            cv2.putText(frame, "ROI", (rx1 + 5, ROI[1] + 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
         # Bbox colorees
         for i in range(len(boxes_list)):
-            bx1, by1, bx2, by2 = [int(v) for v in boxes_list[i]]
+            bx1_raw, by1, bx2_raw, by2 = [int(v) for v in boxes_list[i]]
+            bx1, bx2 = fx(bx1_raw), fx(bx2_raw)
+            if bx1 > bx2:
+                bx1, bx2 = bx2, bx1
             tid = tracker_list[i]
             if tid in user_data.counted_ids:
                 color = (0, 0, 255)  # Rouge = compte
@@ -158,10 +175,11 @@ def app_callback(pad, info, user_data):
 
         # Ligne de comptage + fleche de direction
         if line_zone is not None:
-            lx = int(width * LINE_X_RATIO)
+            lx = fx(int(width * LINE_X_RATIO))
             cv2.line(frame, (lx, 0), (lx, height), (0, 255, 255), 3)
             arrow_y = 30
-            if DIRECTION == "ltr":
+            # En miroir la fleche visuelle s'inverse aussi
+            if (DIRECTION == "ltr") != MIRROR:
                 cv2.arrowedLine(frame, (lx - 40, arrow_y), (lx + 40, arrow_y), (0, 255, 255), 2, tipLength=0.4)
             else:
                 cv2.arrowedLine(frame, (lx + 40, arrow_y), (lx - 40, arrow_y), (0, 255, 255), 2, tipLength=0.4)
@@ -200,12 +218,15 @@ if __name__ == "__main__":
         help='Direction comptee: ltr=gauche vers droite, rtl=droite vers gauche (defaut: ltr)')
     custom_parser.add_argument('--line-x', type=float, default=0.5,
         help='Position X de la ligne en ratio 0.0-1.0 (defaut: 0.5 = milieu)')
+    custom_parser.add_argument('--mirror', action='store_true',
+        help='Retourner l\'image horizontalement (effet miroir)')
     custom_args, remaining = custom_parser.parse_known_args()
     sys.argv = [sys.argv[0]] + remaining
 
     # Appliquer la configuration
     DIRECTION = custom_args.direction
     LINE_X_RATIO = custom_args.line_x
+    MIRROR = custom_args.mirror
 
     if custom_args.roi:
         try:
@@ -220,6 +241,8 @@ if __name__ == "__main__":
     dir_label = "gauche vers droite" if DIRECTION == "ltr" else "droite vers gauche"
     print(f"Direction: {dir_label}")
     print(f"Position ligne: {LINE_X_RATIO:.0%}")
+    if MIRROR:
+        print(f"Miroir: actif")
     if ROI:
         print(f"ROI: ({ROI[0]},{ROI[1]}) vers ({ROI[2]},{ROI[3]})")
 
