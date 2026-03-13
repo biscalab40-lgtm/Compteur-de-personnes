@@ -51,5 +51,11 @@ python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --roi 10
 # Tout combiné : ROI + direction + ligne à 40% de l'image
 python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --roi 100,50,500,400 --direction rtl --line-x 0.4
 
+# Avec Mirror
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mirror
+
 --direction ltr|rtl : une flèche jaune sur la ligne indique la direction comptée. supervision.LineZone différencie IN et OUT selon l'orientation de la ligne (start→end), donc on inverse les points pour changer de direction.
 --roi x1,y1,x2,y2 : rectangle magenta affiché, seules les détections dont le centre est à l'intérieur sont prises en compte pour le tracking et le comptage.
+
+--mirror au script. on retourne le frame puis on dessine dessus avec les coordonnées inversées. Le fonctionnement : le frame est retourné horizontalement avec cv2.flip, puis les bbox, la ligne, le ROI et la flèche de direction sont redessinés avec les coordonnées X inversées. La détection et le comptage restent sur l'image originale (non miroir) pour ne rien perturber — seul l'affichage est retourné.
+La flèche de direction s'adapte aussi : en mode --mirror --direction ltr, la flèche pointe visuellement vers la droite.
