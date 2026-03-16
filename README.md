@@ -59,3 +59,11 @@ python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mirror
 
 --mirror au script. on retourne le frame puis on dessine dessus avec les coordonnées inversées. Le fonctionnement : le frame est retourné horizontalement avec cv2.flip, puis les bbox, la ligne, le ROI et la flèche de direction sont redessinés avec les coordonnées X inversées. La détection et le comptage restent sur l'image originale (non miroir) pour ne rien perturber — seul l'affichage est retourné.
 La flèche de direction s'adapte aussi : en mode --mirror --direction ltr, la flèche pointe visuellement vers la droite.
+
+# Avec MQTT vers ton serveur
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mqtt 192.168.52.139
+
+# Toutes les options
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame \
+  --mqtt 192.168.52.139 --mqtt-port 1883 \
+  --mqtt-topic compteur/personnes --mqtt-interval 60
