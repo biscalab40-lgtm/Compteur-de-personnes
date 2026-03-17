@@ -67,3 +67,34 @@ python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mqtt 1
 python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame \
   --mqtt 192.168.52.139 --mqtt-port 1883 \
   --mqtt-topic compteur/personnes --mqtt-interval 60
+
+# Avec authentification
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame \
+  --mqtt 192.168.52.139 --mqtt-user monuser --mqtt-pass monpass
+
+# --- Mode latéral (inchangé, défaut) ---
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --direction rtl --roi 100,50,500,400
+
+Récap des deux modes :
+                    lateral                     top
+Ligne               Verticale                   Horizontale
+--line-pos 0.5      Milieu X du ROI/image       Milieu Y du ROI/image   
+Directions          ltr (gauche→droite), rtl    ttb (haut→bas), btt
+Défaut direction    ltr                         ttb
+Flèche              Horizontale ← →             Verticale ↑ ↓
+
+# --- Mode top (vue plongeante) ---
+# Ligne horizontale, comptage haut vers bas
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mode top
+
+# Ligne horizontale, comptage bas vers haut
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mode top --direction btt
+
+# Vue plongeante + ROI + ligne au tiers supérieur
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mode top --roi 50,50,600,600 --line-pos 0.3
+
+# Tout combiné : top + ROI + direction + miroir + MQTT
+python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame \
+  --mode top --direction btt --roi 50,50,600,600 --line-pos 0.4 \
+  --mirror --mqtt 192.168.52.139
