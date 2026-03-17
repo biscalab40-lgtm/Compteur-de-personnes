@@ -97,4 +97,6 @@ python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame --mode t
 # Tout combiné : top + ROI + direction + miroir + MQTT
 python basic_pipelines/detectionPersonnesV60.py --input usb --use-frame \
   --mode top --direction btt --roi 50,50,600,600 --line-pos 0.4 \
-  --mirror --mqtt 192.168.52.139
+  --mirror --mqtt 192.168.0.1
+
+  python basic_pipelines/detectionPersonnesV63.py --input usb --use-frame --roi 200,0,700,720 --mqtt 192.168.0.1 --mqtt-port 1883 --mqtt-topic compteur/personnes --mqtt-interval 60  --mqtt-user username --mqtt-pass passwd
